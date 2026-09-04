@@ -64,7 +64,7 @@ COVERAGE_TARGET = 0.995
 # most `num_rays` (720) cells no matter how much wall is in view. On a map with
 # 55k observable wall cells that ceiling is 1.3% of the map, so a threshold
 # expressed as a fraction of total wall would reject every possible stop.
-MIN_GAIN_RAY_FRAC = 0.35
+MIN_GAIN_RAY_FRAC = 0.25
 
 # The primary metric is coverage and each stop can only ever add ~720 cells, so
 # the stop budget is the real dial between metric 1 and metrics 2/3.
