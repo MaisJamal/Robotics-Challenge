@@ -27,6 +27,7 @@ from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import OccupancyGrid
 from rclpy.action import ActionClient
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_srvs.srv import Trigger
 
 
@@ -41,8 +42,18 @@ class ExplorerNode(Node):
     def __init__(self) -> None:
         super().__init__("candidate_explorer")
 
+        # /map is published by slam_toolbox with a latched QoS
+        # (RELIABLE + TRANSIENT_LOCAL, depth 1). Match it so we (a) are
+        # compatible with the publisher at all and (b) get the last map
+        # immediately on subscribe instead of waiting for the next update.
         self.latest_map: OccupancyGrid | None = None
-        self.map_sub = self.create_subscription(OccupancyGrid, "/map", self._on_map, 10)
+        self.map_count = 0
+        map_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
+        self.map_sub = self.create_subscription(OccupancyGrid, "/map", self._on_map, map_qos)
 
         self.nav_client = ActionClient(self, NavigateToPose, "/navigate_to_pose")
         self.finish_client = self.create_client(Trigger, "/finish_exploration")
@@ -57,6 +68,37 @@ class ExplorerNode(Node):
 
     def _on_map(self, msg: OccupancyGrid) -> None:
         self.latest_map = msg
+        self.map_count += 1
+        if self.map_count == 1:
+            info = msg.info
+            self.get_logger().info(
+                f"/map: {info.width}x{info.height} @ {info.resolution:.3f} m/cell, "
+                f"origin ({info.origin.position.x:.2f}, {info.origin.position.y:.2f})"
+            )
+
+    def world_to_cell(self, x: float, y: float) -> tuple[int, int] | None:
+        """Map-frame metres -> (col, row) index into latest_map.data, or None
+        if the point falls outside the current grid."""
+        if self.latest_map is None:
+            return None
+        info = self.latest_map.info
+        col = int((x - info.origin.position.x) / info.resolution)
+        row = int((y - info.origin.position.y) / info.resolution)
+        if 0 <= col < info.width and 0 <= row < info.height:
+            return col, row
+        return None
+
+    def cell_to_world(self, col: int, row: int) -> tuple[float, float]:
+        """(col, row) -> map-frame metres at the centre of that cell."""
+        info = self.latest_map.info
+        return (
+            info.origin.position.x + (col + 0.5) * info.resolution,
+            info.origin.position.y + (row + 0.5) * info.resolution,
+        )
+
+    def cell_value(self, col: int, row: int) -> int:
+        """Occupancy at (col, row): -1 unknown, 0 free, 100 occupied."""
+        return self.latest_map.data[row * self.latest_map.info.width + col]
 
     def get_home_pose_in_map_frame(self) -> PoseStamped | None:
         try:
