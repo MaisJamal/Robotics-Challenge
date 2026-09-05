@@ -60,7 +60,7 @@ class ExplorerNode(Node):
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
-
+        
         self.state = "WAITING_FOR_MAP"
         self._goal_in_progress = False
 
@@ -164,6 +164,22 @@ class ExplorerNode(Node):
             if self._goal_in_progress:
                 return
 
+            def GoToPose(x,y,yaw,then):
+                pose = PoseStamped()
+                pose.header.frame_id = "odom"
+                pose.header.stamp = self.get_clock().now().to_msg()
+                pose.pose.position.x = x
+                pose.pose.position.y = y
+                pose.pose.orientation = yaw_to_quaternion(yaw)
+                self.send_nav_goal(pose, then)
+
+            def AfterFirst(success: bool) -> None:
+                self.get_logger().info(f"called after reaching first pose. Success:{success}")
+                GoToPose(2.5, 1.0, 0.8, AfterSecond)    # inside the room
+
+            def AfterSecond(success: bool) -> None:
+                self.get_logger().info(f"called after reaching second pose. Success:{success}")
+                self.state = "RETURNING"
             # ============================================================
             # TODO: replace this. Placeholder baseline: send exactly one
             # goal, a fixed distance straight ahead in the odom frame, then
@@ -171,17 +187,18 @@ class ExplorerNode(Node):
             # proves map subscription + action client + TF + finish service
             # all work end-to-end. It does not meaningfully explore anything.
             # ============================================================
-            pose = PoseStamped()
-            pose.header.frame_id = "odom"
-            pose.header.stamp = self.get_clock().now().to_msg()
-            pose.pose.position.x = 1.0
-            pose.pose.orientation = yaw_to_quaternion(0.0)
+            
+            GoToPose(1.0, 0.0, 0.0, AfterFirst)
 
             def _on_done(success: bool) -> None:
                 self.get_logger().info(f"placeholder exploration goal finished, success={success}")
                 self.state = "RETURNING"
 
-            self.send_nav_goal(pose, _on_done)
+            # self.send_nav_goal(pose, _on_done)
+            
+            self.get_logger().info(f"testing ... ")
+
+
             return
 
         if self.state == "RETURNING":
