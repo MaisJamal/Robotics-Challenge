@@ -10,7 +10,7 @@
 local_costmap:
   local_costmap:
     ros__parameters:
-      update_frequency: 5.0
+      update_frequency: 10.0
       publish_frequency: 2.0
       global_frame: odom
       robot_base_frame: base_link
@@ -19,12 +19,12 @@ local_costmap:
       width: 5
       height: 5
       resolution: 0.02
-      robot_radius: 0.2
+      robot_radius: 0.2   # must match the real robot: padding it shut doorways
       plugins: ["obstacle_layer", "inflation_layer"]
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 3.0
-        inflation_radius: 0.1
+        cost_scaling_factor: 2.5
+        inflation_radius: 0.45
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
@@ -48,7 +48,7 @@ global_costmap:
       global_frame: map
       robot_base_frame: base_link
       use_sim_time: False
-      robot_radius: 0.2
+      robot_radius: 0.2   # must match the real robot: padding it shut doorways
       resolution: 0.02
       track_unknown_space: true
       plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
@@ -70,6 +70,6 @@ global_costmap:
         map_subscribe_transient_local: True
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 3.0
-        inflation_radius: 0.1
+        cost_scaling_factor: 2.5
+        inflation_radius: 0.45
       always_send_full_costmap: True
