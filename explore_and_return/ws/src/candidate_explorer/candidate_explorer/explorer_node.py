@@ -82,7 +82,7 @@ class ExplorerNode(Node):
         self.declare_parameter("stuck_distance_m", 0.15)
         # Leave 0.10 m below the scorer limit without chasing millimetres
         # around a rounded 0.15 m reading after Nav2 has already succeeded.
-        self.declare_parameter("home_tolerance_m", 0.20)
+        self.declare_parameter("home_tolerance_m", 0.25)
         self.declare_parameter("max_home_attempts", 40)
         self.declare_parameter("finish_reserve_s", 60.0)
         self.declare_parameter("home_attempt_gap_s", 15.0)
