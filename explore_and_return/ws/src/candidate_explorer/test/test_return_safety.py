@@ -97,6 +97,31 @@ class ReturnSafetyTests(unittest.TestCase):
         planner.cfg.time_pressure_gain = 0.
         self.assertAlmostEqual(planner.time_pressure(2., 1800., 5400.), reserve / 3600.)
 
+    def test_return_accepts_distance_that_rounds_to_point_fifteen(self):
+        node = object.__new__(ExplorerNode)
+        node._goal_in_progress = False
+        node.planner = SimpleNamespace(now_s=0.)
+        node.elapsed_s = lambda: 100.
+        node.remaining_s = lambda: 5000.
+        node.finish_reserve_s = 60.
+        node.distance_to_home_m = lambda: .1508
+        node.home_tolerance_m = .20
+        node.get_logger = Mock()
+        node.state = 'RETURNING'
+        node._return_tick()
+        self.assertEqual(node.state, 'FINISHING')
+
+    def test_failed_grade_still_acknowledges_finalization(self):
+        node = object.__new__(ExplorerNode)
+        node.state = 'FINISHING'
+        node.finish_client = Mock()
+        node.get_logger = Mock()
+        response = Future()
+        node.finish_client.call_async.return_value = response
+        node.call_finish_exploration()
+        response.set_result(SimpleNamespace(success=False, message='success=False report_written_to=/tmp/report.yaml'))
+        self.assertEqual(node.state, 'DONE')
+
     def test_deadline_cancels_active_goal_and_recovery(self):
         node = object.__new__(ExplorerNode)
         node.state = 'RETURNING'
