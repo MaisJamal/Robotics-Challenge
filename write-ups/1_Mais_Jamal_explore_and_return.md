@@ -44,6 +44,10 @@ w_home(t) = 0.30·(0.25 + 2.5·pressure)
 
 This increases the home penalty as time passes. Separate affordability checks reserve enough estimated time for the outward and return journeys. The heuristic balances useful observation against travel and return burden, but does not guarantee optimal ordering or completion of one room before moving elsewhere.
 
+## Return-home logic
+
+The robot switches to return mode when the coverage target or exploration limit is reached, useful affordable frontiers are exhausted, or return-route verification remains unsuccessful after rechecking fresh maps. Home is the odom origin, transformed into the map frame using the current TF before each attempt. Nav2 receives a reachable target near home; failed approaches try alternative targets, and watchdog-detected stalls can trigger reverse-and-turn recovery. Once the estimated home distance is within the configured tolerance, the node calls `/finish_exploration`. Retry and time limits also end the session if returning fails. The scorer independently checks true home distance, so odometry-based arrival does not guarantee success.
+
 ## Issues addressed during development
 
 - **Startup failures:** enforced simulation time, waited for Nav2 readiness, and avoided blacklisting goals when the action server was unavailable.
