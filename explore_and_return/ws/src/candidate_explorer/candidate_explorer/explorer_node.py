@@ -724,9 +724,8 @@ class ExplorerNode(Node):
 
         if not cands:
             self._no_candidate_cycles += 1
-            # Two consecutive empty cycles: either the frontier set is
-            # genuinely exhausted or everything left is unreachable or too
-            # expensive. Either way this is "good enough", not a failure.
+            # Distinguish rejected proposals from exhausted frontiers or
+            # scored candidates that actually exceed the time budget.
             self.get_logger().warn(
                 f"no candidates (cycle {self._no_candidate_cycles}): "
                 f"{result.n_clusters} frontier clusters, {result.n_proposals} proposals, "
@@ -734,8 +733,13 @@ class ExplorerNode(Node):
                 f"{len(result.candidates)} scored before affordability, "
                 f"{self.remaining_s():.0f}s left"
             )
+            if result.n_clusters > 0 and not result.candidates:
+                # Replan as maps change and temporary failure blocks expire.
+                # Rejections do not establish that exploration is complete.
+                self._no_candidate_cycles = 0
+                return
             if self._no_candidate_cycles >= 2 and not self._goal_in_progress:
-                self.get_logger().info("no affordable frontiers left; exploration complete")
+                self.get_logger().info("frontiers exhausted or scored goals exceed the time budget; returning")
                 self.state = "RETURNING"
             return
         self._no_candidate_cycles = 0

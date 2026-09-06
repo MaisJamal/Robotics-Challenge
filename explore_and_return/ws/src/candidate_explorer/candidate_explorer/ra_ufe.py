@@ -675,7 +675,7 @@ class Planner:
 
     # -- the pipeline ------------------------------------------------------
 
-    def _proposals(self, view: GridView, clusters, reachable_safe, cost_from_robot) -> list:
+    def _proposals(self, view: GridView, clusters, reachable_safe, cost_from_robot, robot_xy=None) -> list:
         """Frontier clusters -> deduplicated safe viewpoint cells.
 
         Each cluster contributes several samples spread along it rather than
@@ -686,6 +686,17 @@ class Planner:
         clusters otherwise burn the whole candidate budget on one spot.
         """
         cfg = self.cfg
+        # Reject unsuitable stopping positions before snapping, so a nearby
+        # frontier can contribute a different viewpoint instead of being lost.
+        reachable_safe = reachable_safe.copy()
+        rows, cols = np.indices(view.codes.shape)
+        wx = view.origin_x + (cols + .5) * view.resolution
+        wy = view.origin_y + (rows + .5) * view.resolution
+        if robot_xy is not None:
+            reachable_safe &= np.hypot(wx - robot_xy[0], wy - robot_xy[1]) >= cfg.min_goal_distance_m
+        for fx, fy, timestamp, count in self.failures:
+            if self.now_s - timestamp < self._block_seconds(count):
+                reachable_safe &= np.hypot(wx - fx, wy - fy) >= cfg.blacklist_radius_m
         min_sep_cells = max(1.0, cfg.viewpoint_min_sep_m / view.resolution)
         accepted: list[tuple[tuple[int, int], int]] = []
 
@@ -859,8 +870,10 @@ class Planner:
             float(cost_to_home[robot_cell])
             if view.in_bounds(*robot_cell) else math.inf
         )
+        fine_return_checked = False
         if not math.isfinite(robot_home_cost) and not at_home:
             robot_home_cost, fine_costs = self._fine_return_field(view, robot_xy, home_xy)
+            fine_return_checked = True
             cost_to_home = np.minimum(cost_to_home, fine_costs)
         # Being physically at home needs no grid route. In the sparse
         # startup map even the current cell may be UNK after downsampling.
@@ -887,7 +900,13 @@ class Planner:
         proposals = []
         raw: list[Candidate] = []
         if clusters:
-            proposals = self._proposals(view, clusters, reachable_safe, cost_from_robot)
+            proposals = self._proposals(view, clusters, reachable_safe, cost_from_robot, robot_xy)
+            # The robot may have a coarse route home while a candidate lies
+            # across a passage erased by downsampling. Verify those too,
+            # sharing at most one fine-resolution sweep per planning cycle.
+            if not fine_return_checked and any(not math.isfinite(cost_to_home[vp]) for vp, _ in proposals):
+                _, fine_costs = self._fine_return_field(view, robot_xy, home_xy)
+                cost_to_home = np.minimum(cost_to_home, fine_costs)
             raw = self._score(
                 view,
                 proposals,

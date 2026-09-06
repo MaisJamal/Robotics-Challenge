@@ -6,7 +6,7 @@ import math
 from pathlib import Path
 import sys
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import numpy as np
 
@@ -156,6 +156,81 @@ class ReturnSafetyTests(unittest.TestCase):
         self.assertFalse(check(70.))
         self.assertFalse(check(130.))
         self.assertTrue(check(160.))  # bounded wait even if maps stop
+
+    def test_filtered_frontiers_do_not_finish_exploration(self):
+        node = object.__new__(ExplorerNode)
+        node.state = 'EXPLORING'
+        node.robot_pose_in_map = lambda: (0., 0., 0.)
+        node.elapsed_s = lambda: 50.
+        node.remaining_s = lambda: 5350.
+        node._update_measured_speed = Mock()
+        node._current_view = Mock()
+        node.get_home_pose_in_map_frame = lambda: SimpleNamespace(
+            pose=SimpleNamespace(position=SimpleNamespace(x=0., y=0.)))
+        node.distance_to_home_m = lambda: 0.
+        node._goal_in_progress = False
+        node._stuck_events = 0
+        node._time_pressure = 0.
+        node.home_tolerance_m = .2
+        node.time_limit_s = 5400.
+        node._no_candidate_cycles = 0
+        node._publish_markers = Mock()
+        node.get_logger = Mock()
+        node.planner = Mock()
+        node.planner.cfg.coverage_target = .92
+        result = SimpleNamespace(est_coverage=.073, home_reachable=True,
+            robot_home_cost=0., candidates=[], n_clusters=4, n_proposals=3,
+            drops={'no_return_route': 1, 'too_close': 1, 'blacklisted': 1})
+        node.planner.plan.return_value = result
+        node.planner.reserve_for_return.return_value = 90.
+        node.planner.time_pressure.return_value = .02
+        for _ in range(5):
+            node._explore_tick()
+        self.assertEqual(node.state, 'EXPLORING')
+        # The existing genuinely-empty frontier termination still works.
+        result.n_clusters = 0
+        node._explore_tick()
+        node._explore_tick()
+        self.assertEqual(node.state, 'RETURNING')
+
+    def test_proposals_find_alternatives_before_scoring(self):
+        planner = Planner(PlannerConfig(target_cell_m=.1))
+        view = planner.build_view(np.zeros((40, 40), dtype=int), .1, 0, 0)
+        robot = view.to_world(20, 20)
+        clusters = [np.array([[20, 20], [20, 21], [21, 20]])]
+        safe = np.ones((40, 40), dtype=bool)
+        costs = np.ones((40, 40))
+        proposals = planner._proposals(view, clusters, safe, costs, robot)
+        self.assertTrue(proposals)
+        first = view.to_world(*proposals[0][0])
+        self.assertGreaterEqual(math.dist(first, robot), planner.cfg.min_goal_distance_m)
+        planner.note_failure(*first)
+        replacements = planner._proposals(view, clusters, safe, costs, robot)
+        self.assertTrue(replacements)
+        self.assertTrue(all(not planner.is_blacklisted(*view.to_world(*vp)) for vp, _ in replacements))
+
+    def test_candidate_gets_fine_check_even_when_robot_route_is_valid(self):
+        planner = Planner(PlannerConfig(target_cell_m=.1, bootstrap_free_cells=0))
+        data = np.full((100, 160), -1, dtype=int)
+        data[20:80, 5:55] = 0
+        data[20:80, 105:155] = 0
+        data[49:51, 55:105] = 0
+        view = planner.build_view(data, .025, 0, 0)
+        robot = (.55, 1.25)
+        candidate_cell = (12, 30)
+        with patch.object(planner, '_proposals', return_value=[(candidate_cell, 5)]), patch.object(
+                planner, '_fine_return_field', wraps=planner._fine_return_field) as fine:
+            result = planner.plan(view, robot, 0., robot)
+        self.assertTrue(result.home_reachable)
+        fine.assert_called_once()
+        self.assertEqual(len(result.candidates), 1)
+        self.assertTrue(math.isfinite(result.candidates[0].home_cost))
+        # A real obstacle separating the rooms must not be bridged.
+        data[:, 79:82] = 100
+        view = planner.build_view(data, .025, 0, 0)
+        with patch.object(planner, '_proposals', return_value=[(candidate_cell, 5)]):
+            result = planner.plan(view, robot, 0., robot)
+        self.assertEqual(result.candidates, [])
 
     def test_deadline_cancels_active_goal_and_recovery(self):
         node = object.__new__(ExplorerNode)
