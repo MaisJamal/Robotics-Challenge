@@ -19,10 +19,17 @@ still counts as something worth looking at.
 
 Every candidate viewpoint is scored with
 
-    U_i = w_I * Ihat_i - w_P * Chat_i - w_H * Hhat_i - w_R * Rhat_i - w_D * Dhat_i
+    U_i = w_I * I_i - w_P * C_i - w_H * H_i - w_R * R_i - w_D * D_i
+where:
 
+I_i: expected information gain;
+C_i: path cost to frontier;
+H_i: estimated future cost from frontier to home;
+R_i: revisit/redundancy penalty;
+D_i: direction-change penalty.
 where each term is min-max normalised across the candidate set so the
 weights are dimensionless and comparable.
+
 """
 from __future__ import annotations
 
