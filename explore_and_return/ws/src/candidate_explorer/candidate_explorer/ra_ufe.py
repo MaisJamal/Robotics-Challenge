@@ -199,7 +199,7 @@ def dijkstra(
     h, w = traversable.shape
     heap: list[tuple[float, int, int]] = []
     for r, c in sources:
-        if 0 <= r < h and 0 <= c < w:
+        if 0 <= r < h and 0 <= c < w and traversable[r, c]:
             dist[r, c] = 0.0
             heap.append((0.0, r, c))
     heapq.heapify(heap)
@@ -212,7 +212,9 @@ def dijkstra(
             nr, nc = r + dr, c + dc
             if not (0 <= nr < h and 0 <= nc < w) or not traversable[nr, nc]:
                 continue
-            nd = d + geom * resolution * step_cost[nr, nc]
+            if dr and dc and not (traversable[r, nc] and traversable[nr, c]):
+                continue
+            nd = d + geom * resolution * (step_cost[r, c] + step_cost[nr, nc]) * 0.5
             if nd < dist[nr, nc]:
                 dist[nr, nc] = nd
                 heapq.heappush(heap, (nd, nr, nc))
@@ -446,6 +448,8 @@ class GridView:
     clearance_m: np.ndarray
     traversable: np.ndarray
     step_cost: np.ndarray
+    fine_codes: np.ndarray | None = None
+    fine_resolution: float = 0.0
 
     def to_world(self, row: int, col: int) -> tuple[float, float]:
         return (
@@ -587,7 +591,7 @@ class Planner:
         if cfg.inflation_radius_m > 0:
             squeeze = np.clip((cfg.inflation_radius_m - clearance) / cfg.inflation_radius_m, 0.0, 1.0)
             step += cfg.inflation_weight * squeeze
-        return GridView(codes, res, origin_x, origin_y, clearance, traversable, step)
+        return GridView(codes, res, origin_x, origin_y, clearance, traversable, step, codes_fine, resolution)
 
     def snap(self, view: GridView, x: float, y: float, max_radius: int = 12) -> tuple[int, int] | None:
         """Nearest traversable cell to a world point. The robot's own cell can
@@ -597,6 +601,36 @@ class Planner:
         if not view.in_bounds(row, col):
             return None
         return nearest_where(view.traversable, row, col, max_radius)
+
+    def _fine_return_field(self, view, robot_xy, home_xy):
+        """Verify a coarse-grid disconnection against the original map.
+
+        Unknown space remains excluded. Costs are sampled at coarse cell
+        centers only after connectivity is established at sensor-map scale.
+        """
+        codes = view.fine_codes
+        res = view.fine_resolution
+        if codes is None or res <= 0 or res >= view.resolution:
+            return math.inf, np.full(view.codes.shape, np.inf)
+        clearance = obstacle_distance(codes) * res
+        known = (codes == FREE) & (clearance >= self.cfg.robot_radius_m)
+        def cell(xy):
+            return (int(math.floor((xy[1] - view.origin_y) / res)),
+                    int(math.floor((xy[0] - view.origin_x) / res)))
+        home_cell, robot_cell = cell(home_xy), cell(robot_xy)
+        step = np.ones(codes.shape, dtype=float)
+        if self.cfg.inflation_radius_m > 0:
+            step += self.cfg.inflation_weight * np.clip(
+                (self.cfg.inflation_radius_m - clearance) / self.cfg.inflation_radius_m, 0., 1.)
+        field = dijkstra(known, step, [home_cell], res)
+        rr, rc = robot_cell
+        robot_cost = float(field[rr, rc]) if 0 <= rr < codes.shape[0] and 0 <= rc < codes.shape[1] else math.inf
+        rows = np.floor((np.arange(view.codes.shape[0]) + .5) * view.resolution / res).astype(int)
+        cols = np.floor((np.arange(view.codes.shape[1]) + .5) * view.resolution / res).astype(int)
+        sampled = np.full(view.codes.shape, np.inf)
+        valid_r, valid_c = rows < codes.shape[0], cols < codes.shape[1]
+        sampled[np.ix_(valid_r, valid_c)] = field[np.ix_(rows[valid_r], cols[valid_c])]
+        return robot_cost, sampled
 
     # -- the pipeline ------------------------------------------------------
 
@@ -688,6 +722,7 @@ class Planner:
         max_steps,
         source: str = "frontier",
         drops: dict | None = None,
+        probe_return_cost: float = math.inf,
     ) -> list[Candidate]:
         cfg = self.cfg
         out: list[Candidate] = []
@@ -710,7 +745,14 @@ class Planner:
                 continue
             home_cost = float(cost_to_home[vp])
             if not math.isfinite(home_cost):
-                home_cost = math.hypot(vx - home_xy[0], vy - home_xy[1]) * 1.3
+                # Bootstrap deliberately enters unknown space. Reserve an
+                # out-and-back probe plus the verified route from the robot.
+                # This is an exploration estimate, not a verified remote route.
+                if source == "probe" and math.isfinite(probe_return_cost):
+                    home_cost = path_cost + probe_return_cost
+                else:
+                    drops["no_return_route"] = drops.get("no_return_route", 0) + 1
+                    continue
 
             gain = raycast_gain(view.codes, vp[0], vp[1], max_steps, cfg.num_rays)
             if gain < cfg.min_gain_cells:
@@ -744,6 +786,7 @@ class Planner:
         robot_yaw: float,
         home_xy: tuple[float, float],
         time_pressure: float = 0.0,
+        at_home: bool = False,
     ) -> PlanResult:
         """One full cycle: Frontiers -> safe viewpoints -> scored candidates.
 
@@ -760,26 +803,31 @@ class Planner:
         small ones.
         """
         cfg = self.cfg
-        euclid_home = math.hypot(robot_xy[0] - home_xy[0], robot_xy[1] - home_xy[1])
-
         start = self.snap(view, *robot_xy)
         if start is None:
-            return PlanResult([], euclid_home * 1.3, False, 0.0, {"no_start": 1}, 0, 0)
+            return PlanResult([], math.inf, False, 0.0, {"no_start": 1}, 0, 0)
         cost_from_robot = dijkstra(view.traversable, view.step_cost, [start], view.resolution)
 
-        home_cell = self.snap(view, *home_xy, max_radius=20)
-        home_reachable = False
-        if home_cell is None:
-            cost_to_home = np.full_like(cost_from_robot, np.inf)
-            robot_home_cost = euclid_home * 1.3
-        else:
-            cost_to_home = dijkstra(view.traversable, view.step_cost, [home_cell], view.resolution)
-            at_robot = float(cost_to_home[start])
-            home_reachable = math.isfinite(at_robot)
-            # Straight line inflated by 1.3 when the grid says "unreachable".
-            # Being pessimistic about the return leg is cheap; being
-            # optimistic about it is the one mistake with no recovery.
-            robot_home_cost = at_robot if home_reachable else euclid_home * 1.3
+        # Return verification never shortcuts through unknown space or snaps
+        # an endpoint across a wall. A disconnected map is uncertainty, not
+        # permission to substitute a straight-line travel estimate.
+        known = view.traversable & (view.codes == FREE)
+        home_cell = view.to_cell(*home_xy)
+        robot_cell = view.to_cell(*robot_xy)
+        cost_to_home = dijkstra(known, view.step_cost, [home_cell], view.resolution)
+        robot_home_cost = (
+            float(cost_to_home[robot_cell])
+            if view.in_bounds(*robot_cell) else math.inf
+        )
+        if not math.isfinite(robot_home_cost) and not at_home:
+            robot_home_cost, fine_costs = self._fine_return_field(view, robot_xy, home_xy)
+            cost_to_home = np.minimum(cost_to_home, fine_costs)
+        # Being physically at home needs no grid route. In the sparse
+        # startup map even the current cell may be UNK after downsampling.
+        # The node confirms this using odometry; never infer it by snapping.
+        if at_home:
+            robot_home_cost = 0.0
+        home_reachable = math.isfinite(robot_home_cost)
 
         max_steps = max(1, int(round(cfg.sensor_range_m / view.resolution)))
         clear_ok = view.clearance_m >= (cfg.robot_radius_m + cfg.safety_margin_m)
@@ -828,6 +876,7 @@ class Planner:
                 max_steps,
                 source="probe",
                 drops=drops,
+                probe_return_cost=robot_home_cost,
             )
 
         if not raw:

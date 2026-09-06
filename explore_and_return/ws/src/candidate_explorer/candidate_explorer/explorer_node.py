@@ -125,6 +125,9 @@ class ExplorerNode(Node):
         self.clear_global = self.create_client(Empty, "/global_costmap/clear_entirely_global_costmap")
         self.unstick_duration_s = float(self.get_parameter("unstick_duration_s").value)
         self._unstick_until_s = -math.inf
+        self._unstick_active = False
+        self._unstick_driving = False
+        self._unstick_wait_until_s = -math.inf
         self._unstick_dir = 1.0
         self._unstick_count = 0
         self.unstick_timer = self.create_timer(0.1, self._unstick_tick)
@@ -135,7 +138,10 @@ class ExplorerNode(Node):
         self.state = "WAITING_FOR_MAP"
         self._goal_handle = None
         self._goal_in_progress = False
+        self._goal_source = None
         self._goal_seq = 0
+        self._nav_outstanding = set()
+        self._return_unverified_since = None
         self._goal_target: tuple[float, float] | None = None
         self._goal_started_s = 0.0
         self._goal_deadline_s = math.inf
@@ -216,30 +222,46 @@ class ExplorerNode(Node):
     # ------------------------------------------------------------- unstick
 
     def unsticking(self) -> bool:
-        return self.elapsed_s() < self._unstick_until_s
+        return self._unstick_active
+
+    def stop_unstick(self) -> None:
+        if self._unstick_driving:
+            self.cmd_pub.publish(Twist())
+        self._unstick_active = False
+        self._unstick_driving = False
+        self._unstick_until_s = -math.inf
 
     def begin_unstick(self, reason: str) -> None:
-        """Reverse-and-turn under direct velocity control.
-
-        Deliberately open loop: the costmap that would inform a smarter
-        manoeuvre is the very thing that is wrong. Turning while reversing is
-        also free by this simulator's accounting -- sim_core applies rotation
-        even when translation is blocked, and only counts a collision when
-        w == 0 -- so this cannot inflate collision_count the way Nav2's
-        straight-line BackUp does.
-        """
+        """Wait for navigation to stop before a bounded reverse-and-turn."""
         self.cancel_goal()
         self._unstick_count += 1
         self._unstick_dir = -self._unstick_dir
-        self._unstick_until_s = self.elapsed_s() + self.unstick_duration_s
+        self._unstick_active = True
+        self._unstick_driving = False
+        self._unstick_wait_until_s = self.elapsed_s() + 5.0
         self._stuck_events = 0
         self.get_logger().warn(f"unstick #{self._unstick_count} ({reason})")
-        for client in (self.clear_local, self.clear_global):
-            if client.service_is_ready():
-                client.call_async(Empty.Request())
 
     def _unstick_tick(self) -> None:
         if not self.unsticking():
+            return
+        now = self.elapsed_s()
+        if self.remaining_s() <= self.finish_reserve_s or self.state not in ("EXPLORING", "RETURNING"):
+            self.stop_unstick()
+            return
+        if self._nav_outstanding:
+            if now >= self._unstick_wait_until_s:
+                self.get_logger().warn("recovery skipped: navigation has not stopped")
+                self.stop_unstick()
+            return
+        if not self._unstick_driving:
+            self._unstick_driving = True
+            self._unstick_until_s = now + self.unstick_duration_s
+            for client in (self.clear_local, self.clear_global):
+                if client.service_is_ready():
+                    client.call_async(Empty.Request())
+        if now >= self._unstick_until_s:
+            self.stop_unstick()
             return
         cmd = Twist()
         cmd.linear.x = -0.12
@@ -336,30 +358,45 @@ class ExplorerNode(Node):
         self._goal_seq += 1
         seq = self._goal_seq
         self._goal_in_progress = True
+        self._nav_outstanding.add(seq)
         send_future = self.nav_client.send_goal_async(goal)
 
         def _on_goal_response(fut):
-            handle = fut.result()
-            if seq != self._goal_seq:
-                return  # superseded before it was even accepted
-            if not handle.accepted:
-                self.get_logger().warn("goal rejected")
-                self._goal_in_progress = False
-                self._goal_handle = None
-                on_done(False)
+            try:
+                handle = fut.result()
+            except Exception as exc:
+                # The server may have accepted the request; do not grant
+                # direct velocity ownership when its state is unknown.
+                self.get_logger().error(f"goal acceptance unavailable: {exc}")
                 return
-            self._goal_handle = handle
+            if not handle.accepted:
+                self._nav_outstanding.discard(seq)
+                if seq == self._goal_seq:
+                    self._goal_in_progress = False
+                    self._goal_handle = None
+                    on_done(False)
+                return
             result_future = handle.get_result_async()
 
             def _on_result(fut2):
+                try:
+                    status = fut2.result().status
+                except Exception as exc:
+                    self.get_logger().error(f"goal result unavailable: {exc}")
+                    return
+                self._nav_outstanding.discard(seq)
                 if seq != self._goal_seq:
-                    return  # stale result from a goal we already preempted
-                status = fut2.result().status
+                    return
                 self._goal_in_progress = False
                 self._goal_handle = None
                 on_done(status == GoalStatus.STATUS_SUCCEEDED)
 
             result_future.add_done_callback(_on_result)
+            if seq != self._goal_seq:
+                # Cancellation can happen before the acceptance arrives.
+                handle.cancel_goal_async()
+            else:
+                self._goal_handle = handle
 
         send_future.add_done_callback(_on_goal_response)
         return True
@@ -379,12 +416,21 @@ class ExplorerNode(Node):
     def call_finish_exploration(self) -> None:
         if not self.finish_client.wait_for_service(timeout_sec=5.0):
             self.get_logger().error("/finish_exploration service not available")
+            self._finish_sent = False
             return
         future = self.finish_client.call_async(Trigger.Request())
 
         def _on_response(fut):
-            res = fut.result()
-            self.get_logger().info(f"Session result: {res.message}")
+            try:
+                res = fut.result()
+                self.get_logger().info(f"Session result: {res.message}")
+                if res.success:
+                    self.state = "DONE"
+                else:
+                    self._finish_sent = False
+            except Exception as exc:
+                self._finish_sent = False
+                self.get_logger().error(f"finish request failed: {exc}")
 
         future.add_done_callback(_on_response)
 
@@ -441,6 +487,7 @@ class ExplorerNode(Node):
         re-scores this goal against its own cycle's candidates instead (see
         _incumbent), because utilities are not comparable across cycles."""
         yaw = math.atan2(cand.y - robot[1], cand.x - robot[0])
+        self._goal_source = cand.source
         self._goal_target = (cand.x, cand.y)
         self._goal_started_s = self.elapsed_s()
         budget = self.planner.travel_time(cand.path_cost)
@@ -526,6 +573,15 @@ class ExplorerNode(Node):
     # ------------------------------------------------------------ the ticks
 
     def _tick(self) -> None:
+        # Session deadlines outrank both navigation and direct recovery.
+        if self.state not in ("DONE", "FINISHING") and self.remaining_s() <= self.finish_reserve_s:
+            self.stop_unstick()
+            self.cancel_goal()
+            self.state = "FINISHING"
+        if self.state == "EXPLORING" and self.elapsed_s() >= self.time_limit_s * self.planner.cfg.explore_budget_fraction:
+            self.stop_unstick()
+            self.cancel_goal()
+            self.state = "RETURNING"
         # While the unstick manoeuvre owns /cmd_vel, stay out of its way:
         # dispatching a goal here would have Nav2 and the manoeuvre fighting
         # over the same topic.
@@ -560,18 +616,6 @@ class ExplorerNode(Node):
             return
 
         if self.state == "EXPLORING":
-            # Checked here, before _explore_tick's own early returns (goal in
-            # progress, replan interval, wedged-and-escaping) can skip past
-            # it. A deadline that only fires when the rest of the pipeline
-            # happens to reach it is not a deadline.
-            if self.elapsed_s() >= self.time_limit_s * self.planner.cfg.explore_budget_fraction:
-                self.get_logger().warn(
-                    f"explore budget cap reached ({self.elapsed_s():.0f}s of "
-                    f"{self.time_limit_s:.0f}s); heading home"
-                )
-                self.cancel_goal()
-                self.state = "RETURNING"
-                return
             self._explore_tick()
             return
 
@@ -580,6 +624,8 @@ class ExplorerNode(Node):
             return
 
         if self.state == "FINISHING":
+            if self._nav_outstanding:
+                return
             if not self._finish_sent:
                 self._finish_sent = True
                 d = self.distance_to_home_m()
@@ -590,7 +636,6 @@ class ExplorerNode(Node):
                     else "finishing"
                 )
                 self.call_finish_exploration()
-            self.state = "DONE"
             return
 
     def _explore_tick(self) -> None:
@@ -628,12 +673,37 @@ class ExplorerNode(Node):
 
         # Pressure carried from the previous cycle seeds the scoring; it is
         # refreshed below once this cycle's true return cost is known.
+        home_distance = self.distance_to_home_m()
         result = self.planner.plan(
-            view, (robot[0], robot[1]), robot[2], home_xy, self._time_pressure
+            view, (robot[0], robot[1]), robot[2], home_xy, self._time_pressure,
+            at_home=(home_distance is not None and home_distance <= self.home_tolerance_m),
         )
 
         # Hard return gate: if getting home is about to stop being affordable,
         # stop exploring now regardless of how good the frontiers look.
+        if not result.home_reachable:
+            # A bootstrap probe was budgeted as an out-and-back observation
+            # maneuver. Let it gather evidence until arrival or its watchdog,
+            # rather than canceling it because the startup map is still sparse.
+            if self._goal_in_progress and self._goal_source == "probe":
+                self._return_unverified_since = None
+                return
+            if self._return_unverified_since is None:
+                self._return_unverified_since = now
+                self.get_logger().warn("return route unverified; pausing new exploration goals")
+            # Allow map updates and an already-running bootstrap probe to
+            # establish free space before committing to return recovery.
+            if now - self._return_unverified_since >= 10.0:
+                self.get_logger().warn(
+                    f"returning: route absent at coarse and full resolution; "
+                    f"robot=({robot[0]:.2f}, {robot[1]:.2f}), "
+                    f"home=({home_xy[0]:.2f}, {home_xy[1]:.2f}), "
+                    f"map_update={self.map_count}, left={self.remaining_s():.0f}s"
+                )
+                self.cancel_goal()
+                self.state = "RETURNING"
+            return
+        self._return_unverified_since = None
         reserve = self.planner.reserve_for_return(result.robot_home_cost)
         self._time_pressure = reserve / max(1.0, self.remaining_s())
         if reserve >= self.remaining_s():
@@ -868,6 +938,7 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        node.stop_unstick()
         node.destroy_node()
         rclpy.shutdown()
 
