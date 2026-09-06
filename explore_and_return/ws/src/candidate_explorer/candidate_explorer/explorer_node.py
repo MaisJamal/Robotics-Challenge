@@ -70,6 +70,7 @@ class ExplorerNode(Node):
         )
 
         self.declare_parameter("time_limit_s", 5400.0)
+        self.declare_parameter("time_pressure_gain", 1.5)
         self.declare_parameter("goal_timeout_scale", 3.0)
         self.declare_parameter("goal_timeout_floor_s", 40.0)
         self.declare_parameter("replan_period_s", 4.0)
@@ -94,7 +95,9 @@ class ExplorerNode(Node):
         self.finish_reserve_s = float(self.get_parameter("finish_reserve_s").value)
         self.home_attempt_gap_s = float(self.get_parameter("home_attempt_gap_s").value)
 
-        self.planner = Planner(PlannerConfig())
+        self.planner = Planner(PlannerConfig(
+            time_pressure_gain=float(self.get_parameter("time_pressure_gain").value),
+        ))
 
         # /map is latched by slam_toolbox (RELIABLE + TRANSIENT_LOCAL, depth
         # 1). Match it, or a late subscriber waits for the next update.
@@ -671,14 +674,20 @@ class ExplorerNode(Node):
             return
         home_xy = (home.pose.position.x, home.pose.position.y)
 
-        # Pressure carried from the previous cycle seeds the scoring; it is
-        # refreshed below once this cycle's true return cost is known.
+        # The planner computes pressure using the current return field and
+        # elapsed budget before ranking this cycle's candidates.
         home_distance = self.distance_to_home_m()
         result = self.planner.plan(
             view, (robot[0], robot[1]), robot[2], home_xy, self._time_pressure,
             at_home=(home_distance is not None and home_distance <= self.home_tolerance_m),
+            elapsed_s=now, time_limit_s=self.time_limit_s,
         )
-
+        #######
+        if result.est_coverage >= self.planner.cfg.coverage_target:
+            self.cancel_goal()
+            self.state = "RETURNING"
+            return
+        #######
         # Hard return gate: if getting home is about to stop being affordable,
         # stop exploring now regardless of how good the frontiers look.
         if not result.home_reachable:
@@ -705,7 +714,9 @@ class ExplorerNode(Node):
             return
         self._return_unverified_since = None
         reserve = self.planner.reserve_for_return(result.robot_home_cost)
-        self._time_pressure = reserve / max(1.0, self.remaining_s())
+        self._time_pressure = self.planner.time_pressure(
+            result.robot_home_cost, now, self.time_limit_s
+        )
         if reserve >= self.remaining_s():
             self.get_logger().warn(
                 f"time reserve reached ({self.remaining_s():.0f} s left, "

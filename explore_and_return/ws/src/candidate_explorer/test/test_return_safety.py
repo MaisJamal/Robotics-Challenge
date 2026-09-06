@@ -88,6 +88,15 @@ class ReturnSafetyTests(unittest.TestCase):
         self.assertFalse(result.home_reachable)
         self.assertTrue(math.isinf(result.robot_home_cost))
 
+    def test_elapsed_pressure_increases_and_can_be_disabled(self):
+        planner = Planner(PlannerConfig())
+        reserve = planner.reserve_for_return(2.)
+        self.assertAlmostEqual(planner.time_pressure(2., 0., 5400.), reserve / 5400.)
+        self.assertAlmostEqual(planner.time_pressure(2., 1800., 5400.), reserve / 3600. + .5)
+        self.assertEqual(planner.time_pressure(2., 5400., 5400.), 1.)
+        planner.cfg.time_pressure_gain = 0.
+        self.assertAlmostEqual(planner.time_pressure(2., 1800., 5400.), reserve / 3600.)
+
     def test_deadline_cancels_active_goal_and_recovery(self):
         node = object.__new__(ExplorerNode)
         node.state = 'RETURNING'

@@ -359,6 +359,8 @@ class PlannerConfig:
     w_info: float = 1.0
     w_path: float = 0.55
     w_home: float = 0.30
+    # Extra pressure from elapsed/session time; 0 restores reserve-only scoring.
+    time_pressure_gain: float = 1.5
     w_revisit: float = 0.35
     w_turn: float = 0.35
 
@@ -787,6 +789,8 @@ class Planner:
         home_xy: tuple[float, float],
         time_pressure: float = 0.0,
         at_home: bool = False,
+        elapsed_s: float | None = None,
+        time_limit_s: float | None = None,
     ) -> PlanResult:
         """One full cycle: Frontiers -> safe viewpoints -> scored candidates.
 
@@ -795,12 +799,9 @@ class Planner:
         and everything downstream -- candidate path costs, return costs, and
         the robot's own distance home -- is read out of them.
 
-        time_pressure in [0, 1] is the fraction of the remaining budget the
-        return leg already claims. At 0 (plenty of time) the return-cost term
-        nearly vanishes and the robot is free to push deep; as it approaches
-        1 the term dominates and candidates near home win. A fixed w_home
-        would either time out on big maps or refuse to leave the room on
-        small ones.
+        When elapsed_s and time_limit_s are supplied, scoring combines this
+        cycle's return reserve with elapsed-budget pressure. time_pressure
+        remains an explicit fallback for offline callers without a clock.
         """
         cfg = self.cfg
         start = self.snap(view, *robot_xy)
@@ -896,6 +897,8 @@ class Planner:
         revisit = _normalise(np.array([c.revisit for c in raw], dtype=np.float64))
         turn = _normalise(np.array([c.turn for c in raw], dtype=np.float64))
 
+        if elapsed_s is not None and time_limit_s is not None:
+            time_pressure = self.time_pressure(robot_home_cost, elapsed_s, time_limit_s)
         w_home = cfg.w_home * (0.25 + 2.5 * float(np.clip(time_pressure, 0.0, 1.0)))
         for i, cand in enumerate(raw):
             cand.utility = (
@@ -915,6 +918,14 @@ class Planner:
         return float(finite.min()) if finite.size else 1e6
 
     # -- time budgeting ----------------------------------------------------
+
+    def time_pressure(self, home_cost_m: float, elapsed_s: float, time_limit_s: float) -> float:
+        """Bounded scoring pressure; hard return gates still use travel time."""
+        elapsed = max(0.0, elapsed_s)
+        limit = max(1.0, time_limit_s)
+        reserve_pressure = self.reserve_for_return(home_cost_m) / max(1.0, limit - elapsed)
+        elapsed_pressure = max(0.0, self.cfg.time_pressure_gain) * elapsed / limit
+        return float(np.clip(reserve_pressure + elapsed_pressure, 0.0, 1.0))
 
     def travel_time(self, distance_m: float) -> float:
         """Seconds to cover `distance_m`, using the speed the robot has
