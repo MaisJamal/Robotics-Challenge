@@ -634,6 +634,45 @@ class Planner:
         sampled[np.ix_(valid_r, valid_c)] = field[np.ix_(rows[valid_r], cols[valid_c])]
         return robot_cost, sampled
 
+    def return_failure_reason(self, view, robot_xy, home_xy):
+        """Diagnose uncertainty without treating unknown routes as safe."""
+        codes = view.fine_codes if view.fine_codes is not None else view.codes
+        res = view.fine_resolution if view.fine_codes is not None else view.resolution
+        clearance = obstacle_distance(codes) * res
+        cells = []
+        for name, (x, y) in (("robot", robot_xy), ("home", home_xy)):
+            r = int(math.floor((y - view.origin_y) / res))
+            c = int(math.floor((x - view.origin_x) / res))
+            if not (0 <= r < codes.shape[0] and 0 <= c < codes.shape[1]):
+                return f"{name}_outside_map"
+            if codes[r, c] == UNK:
+                return f"{name}_unknown"
+            if codes[r, c] == OCC or clearance[r, c] < self.cfg.robot_radius_m:
+                return f"{name}_blocked_or_low_clearance"
+            cells.append((r, c))
+        # Connectivity only: no weighted sweep is needed for this diagnosis.
+        # Allowing unknown here distinguishes uncertainty from mapped blockage;
+        # it never changes the field used for return affordability.
+        allowed = (codes != OCC) & (clearance >= self.cfg.robot_radius_m)
+        seen = np.zeros(codes.shape, dtype=bool)
+        queue = deque([cells[0]])
+        seen[cells[0]] = True
+        while queue:
+            r, c = queue.popleft()
+            if (r, c) == cells[1]:
+                return "unknown_gap"
+            for dr, dc, _ in _NEIGHBOURS:
+                nr, nc = r + dr, c + dc
+                if not (0 <= nr < codes.shape[0] and 0 <= nc < codes.shape[1]):
+                    continue
+                if seen[nr, nc] or not allowed[nr, nc]:
+                    continue
+                if dr and dc and not (allowed[r, nc] and allowed[nr, c]):
+                    continue
+                seen[nr, nc] = True
+                queue.append((nr, nc))
+        return "obstacles_or_clearance_disconnect"
+
     # -- the pipeline ------------------------------------------------------
 
     def _proposals(self, view: GridView, clusters, reachable_safe, cost_from_robot) -> list:

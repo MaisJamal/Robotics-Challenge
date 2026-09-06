@@ -122,6 +122,41 @@ class ReturnSafetyTests(unittest.TestCase):
         response.set_result(SimpleNamespace(success=False, message='success=False report_written_to=/tmp/report.yaml'))
         self.assertEqual(node.state, 'DONE')
 
+    def test_return_failure_diagnosis(self):
+        planner = Planner(PlannerConfig(target_cell_m=.1))
+        data = np.zeros((30, 50), dtype=int)
+        data[:, 24:26] = -1
+        view = planner.build_view(data, .1, 0, 0)
+        self.assertEqual(planner.return_failure_reason(view, (1., 1.), (4., 1.)), 'unknown_gap')
+        self.assertEqual(planner.return_failure_reason(view, (2.45, 1.), (4., 1.)), 'robot_unknown')
+        data[:, 24:26] = 100
+        view = planner.build_view(data, .1, 0, 0)
+        self.assertEqual(planner.return_failure_reason(view, (1., 1.), (4., 1.)), 'obstacles_or_clearance_disconnect')
+        self.assertEqual(planner.return_failure_reason(view, (1., 1.), (2.45, 1.)), 'home_blocked_or_low_clearance')
+
+    def test_return_revalidation_requires_time_and_fresh_checks(self):
+        node = object.__new__(ExplorerNode)
+        node._return_unverified_since = None
+        node.map_count = 1
+        node.planner = Mock()
+        node.planner.return_failure_reason.return_value = 'unknown_gap'
+        node.get_logger = Mock()
+        node.remaining_s = lambda: 5000.
+        check = lambda t: node._return_check_expired(None, (0, 0), (1, 1), t)
+        self.assertFalse(check(0.))
+        self.assertFalse(check(10.))
+        self.assertFalse(check(60.))  # unchanged map is not another check
+        for count in (2, 3):
+            node.map_count = count
+            self.assertFalse(check(61.))
+        node.map_count = 4
+        self.assertTrue(check(62.))
+        # A restored route resets the window in _explore_tick.
+        node._return_unverified_since = None
+        self.assertFalse(check(70.))
+        self.assertFalse(check(130.))
+        self.assertTrue(check(160.))  # bounded wait even if maps stop
+
     def test_deadline_cancels_active_goal_and_recovery(self):
         node = object.__new__(ExplorerNode)
         node.state = 'RETURNING'

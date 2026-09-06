@@ -701,18 +701,7 @@ class ExplorerNode(Node):
             if self._goal_in_progress and self._goal_source == "probe":
                 self._return_unverified_since = None
                 return
-            if self._return_unverified_since is None:
-                self._return_unverified_since = now
-                self.get_logger().warn("return route unverified; pausing new exploration goals")
-            # Allow map updates and an already-running bootstrap probe to
-            # establish free space before committing to return recovery.
-            if now - self._return_unverified_since >= 10.0:
-                self.get_logger().warn(
-                    f"returning: route absent at coarse and full resolution; "
-                    f"robot=({robot[0]:.2f}, {robot[1]:.2f}), "
-                    f"home=({home_xy[0]:.2f}, {home_xy[1]:.2f}), "
-                    f"map_update={self.map_count}, left={self.remaining_s():.0f}s"
-                )
+            if self._return_check_expired(view, (robot[0], robot[1]), home_xy, now):
                 self.cancel_goal()
                 self.state = "RETURNING"
             return
@@ -790,6 +779,32 @@ class ExplorerNode(Node):
                 )
                 self.cancel_goal()
                 self._dispatch(best, robot)
+
+    def _return_check_expired(self, view, robot_xy, home_xy, now):
+        """Recheck fresh maps before committing to return; never wait forever."""
+        if self._return_unverified_since is None:
+            self._return_unverified_since = now
+            self._return_check_map = self.map_count
+            self._return_check_updates = 0
+            self._return_check_reason = self.planner.return_failure_reason(view, robot_xy, home_xy)
+            self.get_logger().warn(
+                f"return route unverified ({self._return_check_reason}); waiting for fresh maps"
+            )
+        elif self.map_count != self._return_check_map:
+            self._return_check_map = self.map_count
+            self._return_check_updates += 1
+        age = now - self._return_unverified_since
+        # Endpoints and unknown gaps get longer to settle than a mapped
+        # obstruction. Three subsequent planning snapshots must also fail.
+        delay = 30.0 if self._return_check_reason == "obstacles_or_clearance_disconnect" else 60.0
+        if age < 90.0 and (age < delay or self._return_check_updates < 3):
+            return False
+        reason = self.planner.return_failure_reason(view, robot_xy, home_xy)
+        self.get_logger().warn(
+            f"returning after revalidation: {reason}; waited={age:.0f}s, "
+            f"fresh_checks={self._return_check_updates}, left={self.remaining_s():.0f}s"
+        )
+        return True
 
     def _incumbent(self, cands):
         """This cycle's candidate for the goal already being pursued.
