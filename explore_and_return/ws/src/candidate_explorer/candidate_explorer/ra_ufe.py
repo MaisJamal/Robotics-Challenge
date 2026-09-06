@@ -19,8 +19,14 @@ still counts as something worth looking at.
 
 Every candidate viewpoint is scored with
 
-    U_i = w_I * Ihat_i - w_P * Chat_i - w_H * Hhat_i - w_R * Rhat_i - w_D * Dhat_i
+    U_i = w_I * I_i - w_P * C_i - w_H * H_i - w_R * R_i - w_D * D_i
+where:
 
+I_i: expected information gain;
+C_i: path cost to frontier;
+H_i: estimated future cost from frontier to home;
+R_i: revisit/redundancy penalty;
+D_i: direction-change penalty.
 where each term is min-max normalised across the candidate set so the
 weights are dimensionless and comparable.
 """
@@ -29,7 +35,7 @@ from __future__ import annotations
 import heapq
 import math
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -52,7 +58,7 @@ _NEIGHBOURS = (
 )
 
 
-# --------------------------------------------------------------- map coding
+# ----------------------- map coding ------------------------------------#
 
 
 def classify(data: np.ndarray, free_thresh: int = 25, occ_thresh: int = 65) -> np.ndarray:
@@ -129,7 +135,7 @@ def obstacle_distance(codes: np.ndarray) -> np.ndarray:
     return d
 
 
-# ------------------------------------------------------------ frontier work
+# ----------------- frontier work ----------------------#
 
 
 def frontier_mask(codes: np.ndarray) -> np.ndarray:
@@ -172,7 +178,7 @@ def cluster_cells(mask: np.ndarray, min_size: int = 3) -> list[np.ndarray]:
     return out
 
 
-# ------------------------------------------------------------------ search
+# --------------------------- search ---------------------------------#
 
 
 def dijkstra(
@@ -276,7 +282,7 @@ def raycast_gain(codes: np.ndarray, r0: int, c0: int, max_steps: int, num_rays: 
     return int(np.unique(rq[hit] * w + cq[hit]).size)
 
 
-# ------------------------------------------------------------- the planner
+# ---------------------------- the planner ---------------------------#
 
 
 @dataclass
@@ -326,7 +332,7 @@ class PlannerConfig:
     probe_count: int = 12
     bootstrap_free_cells: int = 400
 
-    # escape manoeuvre
+    # escape maneuver
     escape_min_m: float = 0.7
     escape_max_m: float = 2.0
 
@@ -338,22 +344,57 @@ class PlannerConfig:
     num_rays: int = 720
     min_gain_cells: int = 8
 
+    # Absolute scales for the two terms that drive the explore/travel
+    # trade-off (see _saturate). Both are half-way points, in metres and in
+    # cells: a viewpoint path_scale_m away scores 0.5 on the path term, and
+    # one revealing gain_scale_cells scores 0.5 on the info term. These
+    # replace min-max for info and path so the ratio between "how much is
+    # there to see" and "how far is it" survives from one cycle to the next.
+    path_scale_m: float = 4.0
+    gain_scale_cells: float = 150.0
+
     # utility weights
     w_info: float = 1.0
     w_path: float = 0.55
     w_home: float = 0.30
     w_revisit: float = 0.35
-    w_turn: float = 0.15
+    w_turn: float = 0.35
 
     # revisit bookkeeping
     revisit_radius_m: float = 0.7
     blacklist_radius_m: float = 0.5
+    # A failed viewpoint is blocked briefly, not banned. Repeat failures in
+    # the same place double the block, up to failure_block_max_s; afterwards
+    # the memory decays into the R_i term rather than vanishing outright.
+    failure_block_s: float = 45.0
+    failure_block_max_s: float = 480.0
+    failure_decay_s: float = 240.0
+    failure_weight: float = 2.0
 
     # return-home budgeting
-    speed_efficiency: float = 0.5  # fraction of max_linear_vel actually achieved
+    speed_efficiency: float = 0.5  # prior, until enough motion to measure one
     max_linear_vel: float = 0.3
-    return_safety: float = 1.6
-    return_margin_s: float = 45.0
+    return_safety: float = 1.8
+    return_margin_s: float = 90.0
+    # Never spend more than this fraction of the budget exploring, whatever
+    # the reserve arithmetic says. A backstop against the estimate itself
+    # being wrong, which is how one run reached 5367 s of a 5400 s budget
+    # still 6.6 m from home.
+    explore_budget_fraction: float = 0.75
+    # Diminishing returns: if the known-free area has grown by less than
+    # plateau_min_growth over the last plateau_window_s, exploring is no
+    # longer buying coverage and the remaining budget is better spent
+    # getting home. Coverage is scored from laser observation, not from
+    # where the robot drove, so the last few percent is usually already
+    # banked by the time the frontier list stops shrinking.
+    # Stop once the map is *good enough*, not once it is complete. success
+    # needs >=80% coverage AND <=0.3 m from home; coverage has ~20 points of
+    # headroom we cannot spend, the home constraint has none. Chasing the
+    # last 15% is what strands the robot far from home on a long return.
+    coverage_target: float = 0.92
+    plateau_window_s: float = 300.0
+    plateau_min_growth: float = 0.02
+    plateau_min_elapsed_s: float = 180.0
 
 
 @dataclass
@@ -375,6 +416,7 @@ class Candidate:
 
 @dataclass
 class PlanResult:
+    """(see below)"""
     """One planning cycle's output. Bundles the return-cost lookup with the
     candidates so a caller never has to re-run Dijkstra to ask "how far am I
     from home right now?"."""
@@ -382,6 +424,15 @@ class PlanResult:
     candidates: list[Candidate]
     robot_home_cost: float
     home_reachable: bool
+    # Self-estimate of coverage: known-free area over known-free plus
+    # still-reachable unknown. The real coverage_fraction is ground truth we
+    # never see, but both are driven by the same laser, so this tracks it.
+    est_coverage: float = 0.0
+    # Why proposals were discarded, so a run that quits early can say which
+    # filter did it instead of only reporting "no candidates".
+    drops: dict = field(default_factory=dict)
+    n_clusters: int = 0
+    n_proposals: int = 0
 
 
 @dataclass
@@ -424,6 +475,29 @@ def _normalise(values: np.ndarray) -> np.ndarray:
     return (values - lo) / (hi - lo)
 
 
+def _saturate(values: np.ndarray, scale: float) -> np.ndarray:
+    """Absolute-scale squash to [0, 1): v / (v + scale).
+
+    Unlike _normalise, this keeps its meaning across cycles and across
+    candidate sets: a viewpoint 2 m away scores 0.33 whether or not a 15 m
+    one happens to share the set. Min-max maps whichever candidate is
+    farthest to exactly 1.0, so the path penalty was a flat w_path however
+    far "far" actually was -- which is how a big room across the map came to
+    look as cheap to reach as the frontier at the robot's feet.
+
+    `scale` is the half-way point: v == scale scores 0.5. Growth is roughly
+    linear below it and flattens above, so the term discriminates where the
+    decision is actually close and stops caring about 30 m vs 40 m.
+    """
+    if values.size == 0:
+        return values
+    v = np.asarray(values, dtype=np.float64)
+    # Non-finite means "unreachable", which is the expensive end, not the
+    # cheap one -- clamping it to 0.0 would score it as free.
+    v = np.where(np.isfinite(v), np.maximum(v, 0.0), 1e9)
+    return v / (v + max(1e-6, float(scale)))
+
+
 class Planner:
     """Stateless per-cycle scoring plus the small amount of history that
     makes the revisit penalty and the blacklist meaningful.
@@ -436,7 +510,11 @@ class Planner:
     def __init__(self, config: PlannerConfig) -> None:
         self.cfg = config
         self.visited: list[tuple[float, float]] = []
-        self.blacklist: list[tuple[float, float]] = []
+        # (x, y, time_of_last_failure, consecutive_failures)
+        self.failures: list[list[float]] = []
+        self.now_s: float = 0.0
+        # Set by the node once the robot has moved far enough to mean anything.
+        self.measured_speed: float | None = None
 
     # -- history -----------------------------------------------------------
 
@@ -445,15 +523,45 @@ class Planner:
             self.visited.append((x, y))
 
     def note_failure(self, x: float, y: float) -> None:
-        self.blacklist.append((x, y))
+        """Record a goal failure. Repeat failures at the same spot compound,
+        lengthening how long it stays blocked."""
+        for entry in self.failures:
+            if math.hypot(x - entry[0], y - entry[1]) < self.cfg.blacklist_radius_m:
+                entry[2] = self.now_s
+                entry[3] += 1
+                return
+        self.failures.append([x, y, self.now_s, 1.0])
+
+    def _block_seconds(self, count: float) -> float:
+        """Exponential backoff, capped: 1 failure is a brief timeout, several
+        in the same place is a long one."""
+        cfg = self.cfg
+        return min(cfg.failure_block_max_s, cfg.failure_block_s * (2.0 ** (count - 1.0)))
 
     def is_blacklisted(self, x: float, y: float) -> bool:
+        """True only while a recent failure is still inside its backoff
+        window. Unlike the old permanent ban this always expires."""
         rr = self.cfg.blacklist_radius_m
-        return any(math.hypot(x - bx, y - by) < rr for bx, by in self.blacklist)
+        for fx, fy, t, count in self.failures:
+            if math.hypot(x - fx, y - fy) < rr and (self.now_s - t) < self._block_seconds(count):
+                return True
+        return False
+
+    def failure_penalty(self, x: float, y: float) -> float:
+        """Decaying memory of past failures, in 'equivalent revisits'. Keeps a
+        recently-failed area unattractive after its hard block expires,
+        without forbidding it."""
+        cfg = self.cfg
+        total = 0.0
+        for fx, fy, t, count in self.failures:
+            if math.hypot(x - fx, y - fy) < cfg.blacklist_radius_m * 1.5:
+                total += count * math.exp(-(self.now_s - t) / cfg.failure_decay_s)
+        return total
 
     def _revisit_score(self, x: float, y: float) -> float:
         rr = self.cfg.revisit_radius_m
-        return float(sum(1 for vx, vy in self.visited if math.hypot(x - vx, y - vy) < rr))
+        visits = float(sum(1 for vx, vy in self.visited if math.hypot(x - vx, y - vy) < rr))
+        return visits + self.cfg.failure_weight * self.failure_penalty(x, y)
 
     # -- map preparation ---------------------------------------------------
 
@@ -579,20 +687,26 @@ class Planner:
         cost_to_home,
         max_steps,
         source: str = "frontier",
+        drops: dict | None = None,
     ) -> list[Candidate]:
         cfg = self.cfg
         out: list[Candidate] = []
+        if drops is None:
+            drops = {}
         for vp, cluster_size in proposals:
             vx, vy = view.to_world(*vp)
             if self.is_blacklisted(vx, vy):
+                drops["blacklisted"] = drops.get("blacklisted", 0) + 1
                 continue
             if math.hypot(vx - robot_xy[0], vy - robot_xy[1]) < cfg.min_goal_distance_m:
                 # Below Nav2's goal tolerance the robot would be declared
                 # "arrived" without moving, and we would re-pick this same
                 # point forever.
+                drops["too_close"] = drops.get("too_close", 0) + 1
                 continue
             path_cost = float(cost_from_robot[vp])
             if not math.isfinite(path_cost):
+                drops["unreachable"] = drops.get("unreachable", 0) + 1
                 continue
             home_cost = float(cost_to_home[vp])
             if not math.isfinite(home_cost):
@@ -600,6 +714,7 @@ class Planner:
 
             gain = raycast_gain(view.codes, vp[0], vp[1], max_steps, cfg.num_rays)
             if gain < cfg.min_gain_cells:
+                drops["low_gain"] = drops.get("low_gain", 0) + 1
                 continue
 
             bearing = math.atan2(vy - robot_xy[1], vx - robot_xy[0])
@@ -649,7 +764,7 @@ class Planner:
 
         start = self.snap(view, *robot_xy)
         if start is None:
-            return PlanResult([], euclid_home * 1.3, False)
+            return PlanResult([], euclid_home * 1.3, False, 0.0, {"no_start": 1}, 0, 0)
         cost_from_robot = dijkstra(view.traversable, view.step_cost, [start], view.resolution)
 
         home_cell = self.snap(view, *home_xy, max_radius=20)
@@ -674,18 +789,27 @@ class Planner:
         standable = view.traversable & clear_ok
         reachable_safe = standable & (view.codes == FREE) & np.isfinite(cost_from_robot)
 
+        reachable = np.isfinite(cost_from_robot)
+        known_free = int(((view.codes == FREE) & reachable).sum())
+        unknown_reach = int(((view.codes == UNK) & reachable).sum())
+        est_coverage = known_free / float(known_free + unknown_reach) if (known_free + unknown_reach) else 0.0
+
         clusters = cluster_cells(frontier_mask(view.codes), cfg.min_cluster_cells)
+        drops: dict = {}
+        proposals = []
         raw: list[Candidate] = []
         if clusters:
+            proposals = self._proposals(view, clusters, reachable_safe, cost_from_robot)
             raw = self._score(
                 view,
-                self._proposals(view, clusters, reachable_safe, cost_from_robot),
+                proposals,
                 robot_xy,
                 robot_yaw,
                 home_xy,
                 cost_from_robot,
                 cost_to_home,
                 max_steps,
+                drops=drops,
             )
 
         # Probes only while the map is still the tiny blob slam_toolbox gives
@@ -703,13 +827,22 @@ class Planner:
                 cost_to_home,
                 max_steps,
                 source="probe",
+                drops=drops,
             )
 
         if not raw:
-            return PlanResult([], robot_home_cost, home_reachable)
+            return PlanResult([], robot_home_cost, home_reachable, est_coverage, drops, len(clusters), len(proposals))
 
-        info = _normalise(np.array([c.gain for c in raw], dtype=np.float64))
-        path = _normalise(np.array([c.path_cost for c in raw], dtype=np.float64))
+        # info and path are scored on absolute scales, not min-max: they are
+        # the two terms that decide "finish this room or cross the map", and
+        # min-max stretched whatever pair happened to be in the set to the
+        # full [0, 1] regardless of the real gap. A 400-cell frontier 2 m
+        # away and a 700-cell one 15 m away came out as info 0.0 vs 1.0 --
+        # a full point of advantage for what is really a 1.75x difference --
+        # which no w_path could answer. The remaining terms stay min-max:
+        # they are tie-breakers within a set, not cross-set comparisons.
+        info = _saturate(np.array([c.gain for c in raw], dtype=np.float64), cfg.gain_scale_cells)
+        path = _saturate(np.array([c.path_cost for c in raw], dtype=np.float64), cfg.path_scale_m)
         home = _normalise(np.array([c.home_cost for c in raw], dtype=np.float64))
         revisit = _normalise(np.array([c.revisit for c in raw], dtype=np.float64))
         turn = _normalise(np.array([c.turn for c in raw], dtype=np.float64))
@@ -724,7 +857,7 @@ class Planner:
                 - cfg.w_turn * turn[i]
             )
         raw.sort(key=lambda c: c.utility, reverse=True)
-        return PlanResult(raw, robot_home_cost, home_reachable)
+        return PlanResult(raw, robot_home_cost, home_reachable, est_coverage, drops, len(clusters), len(proposals))
 
     @staticmethod
     def _cluster_cost(cluster: np.ndarray, cost: np.ndarray) -> float:
@@ -735,8 +868,17 @@ class Planner:
     # -- time budgeting ----------------------------------------------------
 
     def travel_time(self, distance_m: float) -> float:
+        """Seconds to cover `distance_m`, using the speed the robot has
+        actually been achieving rather than a fixed fraction of its cap.
+
+        The assumed 0.15 m/s was far too generous once recovery behaviours,
+        replanning and wall-grinding are counted, so the return reserve came
+        out roughly half what it needed to be."""
         cfg = self.cfg
-        speed = max(0.05, cfg.max_linear_vel * cfg.speed_efficiency)
+        if self.measured_speed is not None:
+            speed = max(0.03, min(cfg.max_linear_vel, self.measured_speed))
+        else:
+            speed = max(0.05, cfg.max_linear_vel * cfg.speed_efficiency)
         return distance_m / speed
 
     def reserve_for_return(self, home_cost_m: float) -> float:
@@ -819,11 +961,11 @@ class Planner:
     def return_targets(
         self,
         view: GridView,
-        home_xy: tuple[float, float],
+        aim_xy: tuple[float, float],
         robot_xy: tuple[float, float],
         count: int = 5,
     ) -> list[tuple[tuple[float, float], float]]:
-        """Occupiable, reachable cells near home, nearest-to-home first.
+        """Occupiable, reachable cells near `aim_xy`, nearest first.
 
         A single target is not enough. This grid is built from the static map
         alone, while Nav2's global costmap also marks live laser returns, so a
@@ -836,8 +978,15 @@ class Planner:
         if start is None:
             return []
         cost = dijkstra(view.traversable, view.step_cost, [start], view.resolution)
+        # Not "strictly FREE". Downsampling marks a coarse cell UNK if any of
+        # its fine children is unknown, and the area around home is mapped
+        # early then never revisited, so it is riddled with unknown speckle.
+        # Demanding FREE there put the nearest "occupiable" cell 1.77 m from
+        # home and made the last two metres unreachable by construction.
+        # Clearance from known walls plus reachability is the honest test,
+        # and it is the same one Nav2 applies with allow_unknown.
         occupiable = (
-            (view.codes == FREE)
+            (view.codes != OCC)
             & (view.clearance_m >= cfg.robot_radius_m)
             & np.isfinite(cost)
         )
@@ -846,7 +995,7 @@ class Planner:
             return []
         wx = view.origin_x + (cols + 0.5) * view.resolution
         wy = view.origin_y + (rows + 0.5) * view.resolution
-        d = np.hypot(wx - home_xy[0], wy - home_xy[1])
+        d = np.hypot(wx - aim_xy[0], wy - aim_xy[1])
         keep = d <= cfg.return_snap_max_m
         if not keep.any():
             keep = d <= (cfg.return_snap_max_m * 2.0)
