@@ -1,0 +1,20 @@
+0.3075000000000001 -0.14250000000000007 5.656854249492381
+0.4999999999999999
+0.75
+len stops at grid & traversable 1068
+No of coverage sets 1068
+number of groups: 7
+No of points inside the group with max coverage(seen wall percent) 383
+TARGET_DIAGNOSTIC {"target": 0.9, "stops": 40, "covered": 6539, "attainable": 7253, "official_coverage": 0.4070085895680319}
+TARGET_DIAGNOSTIC {"target": 0.95, "stops": 63, "covered": 6891, "attainable": 7253, "official_coverage": 0.42891821237395744}
+TARGET_DIAGNOSTIC {"target": 0.995, "stops": 140, "covered": 7217, "attainable": 7253, "official_coverage": 0.4492095107680817}
+len stops  63
+VALIDATION: deterministic selection; all stops valid; all tour segments connected
+Map:              maps/5/room.yaml
+Planning time:    23.86s
+Wall coverage:      42.9%  (6891/16066 observable wall cells at required quality)
+Stops used:         63
+Tour length:        48.1 m (through free space, not a straight line)
+Note:               4211 wall cells excluded from coverage denominator (buried inside wall thickness, unreachable by any ray)
+Report JSON:      /tmp/viewpoint-attainable-coverage/map5/20260907_044809/coverage_report.json
+Visualization:    /tmp/viewpoint-attainable-coverage/map5/20260907_044809/coverage_report.png

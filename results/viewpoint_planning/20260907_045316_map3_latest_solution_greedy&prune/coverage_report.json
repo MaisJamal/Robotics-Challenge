@@ -1,0 +1,11 @@
+{
+  "map": "maps/3/room.yaml",
+  "planning_time_s": 328.66575607399864,
+  "coverage_fraction": 0.41992666649080695,
+  "covered_wall_cells": 15919,
+  "total_wall_cells": 37909,
+  "unreachable_wall_cells": 11719,
+  "num_stops": 152,
+  "tour_length_m": 147.9564079224963,
+  "invalid_stops": []
+}
