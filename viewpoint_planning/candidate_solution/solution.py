@@ -13,9 +13,9 @@ See README.md for the full brief, scoring rubric, and how to run
 """
 """Baseline viewpoint planner: greedy set-cover + nearest-neighbor/2-opt tour.
 
-  1. We construct a regular grid of candidate stops over free space, keeping only 
-     poses where the robot's footprint actually fits. Depending on effective radius
-     of scanning and the traversable mask of the map.
+  1. We construct a coarse grid of candidate stops over free space and add
+     denser samples near walls, doorways and corners, keeping only poses
+     where the robot's footprint actually fits.
   2. We define the connected groups of the candidate poses and evaluate them against
      the percentage of seen walls' cells by the function (`reachable_wall`) with 
      ray-casting a full 360-degree scan from each candidate (`scan_from_stop`) and
@@ -34,7 +34,7 @@ same order.
 
 import numpy as np
 
-from sim.map_io import OccupancyGrid
+from sim.map_io import OCCUPIED, OccupancyGrid
 from sim.pathing import multi_target_shortest_paths, traversable_mask
 from sim.visibility import (
     SensorModel,
@@ -49,11 +49,12 @@ from sim.visibility import (
 # duplicates and errors.
 ROBOT_RADIUS_M = 0.2  
 
-# Spacing of the candidate lattice. Well under the sensor's effective radius
-# (~5.7 m at max_range 8 m / min_quality 0.5) so the greedy step has real
-# choice about where to stand; scans cost ~5 ms each, so a few hundred
-# candidates is affordable.
+# Retain coarse samples in open space and add a finer lattice near walls.
+# Doorways and corners need nearby alternatives because visibility changes
+# sharply there. The wall band uses a square (Chebyshev-distance) neighborhood.
 CANDIDATE_SPACING_M = 0.75
+WALL_CANDIDATE_SPACING_M = 0.25
+WALL_CANDIDATE_BAND_M = 1.0
 
 # Stop adding stops once we're this close to covering everything reachable...
 COVERAGE_TARGET = 0.995
@@ -91,17 +92,47 @@ def quality_for_range(range_m, sensor: SensorModel):
 
 
 
+def _wall_neighborhood(grid: OccupancyGrid, distance_m: float) -> np.ndarray:
+    """Cells within a square neighborhood of an occupied cell.
+
+    A summed-area table keeps this O(height * width), independent of the
+    band width in pixels, without adding a dependency or treating the map
+    boundary itself as a wall.
+    """
+    radius = max(0, int(np.ceil(distance_m / grid.resolution)))
+    occupied = grid.data == OCCUPIED
+    summed = np.pad(occupied, ((1, 0), (1, 0))).cumsum(
+        axis=0, dtype=np.int64).cumsum(axis=1, dtype=np.int64)
+    rows = np.arange(grid.height)
+    cols = np.arange(grid.width)
+    top = np.maximum(rows - radius, 0)[:, None]
+    bottom = np.minimum(rows + radius + 1, grid.height)[:, None]
+    left = np.maximum(cols - radius, 0)[None, :]
+    right = np.minimum(cols + radius + 1, grid.width)[None, :]
+    return (summed[bottom, right] - summed[top, right]
+            - summed[bottom, left] + summed[top, left]) > 0
+
+
 def _candidate_poses(grid: OccupancyGrid, traversable: np.ndarray,
                      spacing_m: float) -> list[tuple[float, float]]:
-    """Regular lattice of world-frame poses over traversable free space.
+    """Coarse open-space samples plus dense samples near walls and openings.
 
     `traversable_mask` applies the same footprint-clearance test as
     `is_stop_valid`, vectorized, so every pose returned here is guaranteed to
-    pass the scorer's validity check.
+    pass the scorer's validity check. Preserve every coarse candidate; union
+    the two lattices before conversion to deduplicate and retain deterministic
+    row-major ordering. This refines wall geometry, not a previous scan's
+    missed-cell mask, so all components get candidates before selection.
     """
     step = max(1, int(round(spacing_m / grid.resolution)))
     lattice = np.zeros_like(traversable)
     lattice[::step, ::step] = True
+    fine_step = max(1, int(round(
+        min(spacing_m, WALL_CANDIDATE_SPACING_M) / grid.resolution)))
+    if fine_step < step:
+        fine_lattice = np.zeros_like(traversable)
+        fine_lattice[::fine_step, ::fine_step] = True
+        lattice |= fine_lattice & _wall_neighborhood(grid, WALL_CANDIDATE_BAND_M)
     rc = np.argwhere(traversable & lattice)  # row-major => deterministic order
     return [grid.pixel_to_world(int(r), int(c)) for r, c in rc]
 
@@ -330,4 +361,3 @@ def plan_viewpoints(grid: OccupancyGrid, sensor: SensorModel) -> list[tuple[floa
             best_order, best_len = order, length
 
     return [stops[i] for i in best_order]
-
