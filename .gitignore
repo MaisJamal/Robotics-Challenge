@@ -4,3 +4,11 @@ explore_and_return/ws/build/
 explore_and_return/ws/install/
 explore_and_return/ws/log/
 *__init__.py
+
+.vscode/
+.idea/
+
+.env
+.env.*
+*.pem
+*.key
