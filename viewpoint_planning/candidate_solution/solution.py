@@ -20,9 +20,8 @@ See README.md for the full brief, scoring rubric, and how to run
      the percentage of seen walls' cells by the function (`reachable_wall`) with 
      ray-casting a full 360-degree scan from each candidate (`scan_from_stop`) and
      record which observable wall cells it sees at >= `sensor.min_quality`.
-  3. We greedily take the candidate covering the most still-uncovered wall, until
-     coverage plateaus (marginal gain below a floor) or the target is hit. Using 
-     greedy algorithm to solve the set-cover problem.
+  3. We greedily cover a target fraction of the selected candidates' wall
+     union, then remove stops while preserving that coverage target.
   4. We order the chosen stops as an open path: nearest-neighbor from every possible
      start, then 2-opt, both over *geodesic* (free-space) distances
      rather than straight lines.
@@ -56,20 +55,11 @@ CANDIDATE_SPACING_M = 0.75
 WALL_CANDIDATE_SPACING_M = 0.25
 WALL_CANDIDATE_BAND_M = 1.0
 
-# Stop adding stops once we're this close to covering everything reachable...
-COVERAGE_TARGET = 0.995
-
-# ...or once the best remaining candidate adds too little to be worth a stop.
-# This is measured against `sensor.num_rays`, NOT against the wall-cell total:
-# every ray terminates at exactly one wall cell, so a single stop can credit at
-# most `num_rays` (720) cells no matter how much wall is in view. On a map with
-# 55k observable wall cells that ceiling is 1.3% of the map, so a threshold
-# expressed as a fraction of total wall would reject every possible stop.
-MIN_GAIN_RAY_FRAC = 0.25
-
-# The primary metric is coverage and each stop can only ever add ~720 cells, so
-# the stop budget is the real dial between metric 1 and metrics 2/3.
-MAX_STOPS = 40
+# Fraction of the union visible from the candidates in the selected component,
+# NOT the scorer's global wall denominator. Leave the expensive final 5% of
+# this sampled union optional; neither a gain floor nor a fixed stop cap can
+# terminate selection before this target. This is not a geometric upper bound.
+COVERAGE_TARGET = 0.95
 
 # Keep every stop inside a single connected region of free space.
 #
@@ -155,28 +145,48 @@ def _coverage_sets(grid: OccupancyGrid, poses: list[tuple[float, float]],
     return sets
 
 
-def _greedy_set_cover(coverage: list[np.ndarray], num_walls: int, num_rays: int) -> list[int]:
-    """Classic greedy max-coverage: repeatedly take the candidate adding the
-    most uncovered cells. Ties go to the lowest candidate index, so the result
-    is reproducible."""
-    covered = np.zeros(num_walls, dtype=bool)
-    min_gain = max(1, int(MIN_GAIN_RAY_FRAC * num_rays))
+def _greedy_set_cover(coverage: list[np.ndarray], num_walls: int) -> list[int]:
+    """Cover the target fraction of the candidate union, then prune stops.
+
+    Greedy selection and removal are heuristics, not a minimum-stop proof.
+    Counts track how many selected stops see each cell, so pruning can spend
+    any coverage surplus without falling below the integer target. Ties in
+    selection and removal go to the lowest candidate index.
+    """
+    if not 0 < COVERAGE_TARGET <= 1:
+        raise ValueError("COVERAGE_TARGET must be in (0, 1]")
+    coverage = [np.unique(cells) for cells in coverage]
+    attainable = np.zeros(num_walls, dtype=bool)
+    for cells in coverage:
+        attainable[cells] = True
+    target_cells = int(np.ceil(COVERAGE_TARGET * np.count_nonzero(attainable)))
+    counts = np.zeros(num_walls, dtype=np.int32)
+    covered_count = 0
     chosen: list[int] = []
 
-    while len(chosen) < MAX_STOPS:
+    while covered_count < target_cells:
         best_i, best_gain = -1, 0
         for i, cells in enumerate(coverage):
             if i in chosen or cells.size == 0:
                 continue
-            gain = int(np.count_nonzero(~covered[cells]))
+            gain = int(np.count_nonzero(counts[cells] == 0))
             if gain > best_gain:  # strict: first index wins a tie
                 best_i, best_gain = i, gain
-        if best_i < 0 or best_gain < min_gain:
+        if best_i < 0:
             break
-        covered[coverage[best_i]] = True
+        counts[coverage[best_i]] += 1
+        covered_count += best_gain
         chosen.append(best_i)
-        if covered.sum() / num_walls >= COVERAGE_TARGET:
+
+    while chosen:
+        loss, candidate = min(
+            (int(np.count_nonzero(counts[coverage[i]] == 1)), i)
+            for i in chosen)
+        if covered_count - loss < target_cells:
             break
+        counts[coverage[candidate]] -= 1
+        covered_count -= loss
+        chosen.remove(candidate)
     return chosen
 
 
@@ -311,7 +321,7 @@ def plan_viewpoints(grid: OccupancyGrid, sensor: SensorModel) -> list[tuple[floa
     # poses = _candidate_poses(grid, traversable, effective_radius_m/10)
 
     if not poses or num_walls == 0:
-        return [(x, y),(x_2,y_2),(x_3,y_3),(x_4,y_4),(x_5,y_5)]
+        return poses[:1]
     #     # Degenerate map: fall back to the free-space centroid so we still
     #     # return something valid rather than an empty plan.
     #     free = grid.free_cells()
@@ -336,12 +346,12 @@ def plan_viewpoints(grid: OccupancyGrid, sensor: SensorModel) -> list[tuple[floa
         print("No of points inside the group with max coverage(seen wall percent)",len(group))
         sub = [coverage[i] for i in group]
         # chosen = group
-        chosen = [group[k] for k in _greedy_set_cover(sub, num_walls, sensor.num_rays)]
+        chosen = [group[k] for k in _greedy_set_cover(sub, num_walls)]
     else:
-        chosen = _greedy_set_cover(coverage, num_walls, sensor.num_rays)
+        chosen = _greedy_set_cover(coverage, num_walls)
 
     if not chosen:
-        return [(x, y),(x_2,y_2),(x_3,y_3),(x_4,y_4),(x_5,y_5)]
+        return poses[:1]
         # chosen = [int(np.argmax([c.size for c in coverage]))]
 
 
