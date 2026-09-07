@@ -76,3 +76,5 @@ Remaining weaknesses include odometry-based home error, sparse-map verification 
 ## With more time
 
 I would tune the utility-function weights and scaling, particularly the balance between information gain, travel, turning, and return pressure. I would investigate maps 2 and 3 further using repeated seeds and recorded scans/TF, improve final home localization, and replace repetitive recovery with clearance-aware maneuvers.
+
+**Sources:** [Yamauchi (1997), *A Frontier-Based Approach for Autonomous Exploration*](https://www.cs.cmu.edu/~motionplanning/papers/sbp_papers/integrated1/yamauchi_frontiers.pdf) — frontier exploration; [Burgard et al. (2005), *Coordinated Multi-Robot Exploration*](https://www.ipb.uni-bonn.de/wp-content/papercite-data/pdf/burgard05tro.pdf) — combining target utility and travel cost. RA-UFE adapts these ideas for a single robot with return-home constraints.
