@@ -198,3 +198,11 @@ Stronger submissions might:
 
 In [write-ups](../write-ups/) document your approach and reasoning behind it, what you'd do with more time,
 and where you expect it to break. you can also use the template located in the directory.
+
+## Exploration Behavior
+
+The flowchart shows the explorer's states, navigation checks, recovery behavior, and return conditions. Click the image to view it at full size.
+
+<a href="docs/exploration.svg">
+  <img src="docs/exploration.svg" alt="Explore and return flowchart showing state transitions, return conditions, watchdog checks, recovery, and finalization" width="1000">
+</a>
