@@ -286,10 +286,7 @@ def _two_opt(order: list[int], dist: np.ndarray, max_passes: int = 50) -> list[i
 
 
 def plan_viewpoints(grid: OccupancyGrid, sensor: SensorModel) -> list[tuple[float, float]]:
-    """Replace this. The placeholder below is intentionally bad — a single
-    stop at the map's centroid — so you can see the scorer and visualization
-    working end-to-end before you touch the algorithm.
-    """
+
     free_cells = grid.free_cells()
     center_row, center_col = free_cells.mean(axis=0)
     x, y = grid.pixel_to_world(int(center_row/2), int(center_col))
@@ -298,11 +295,6 @@ def plan_viewpoints(grid: OccupancyGrid, sensor: SensorModel) -> list[tuple[floa
     print (x,y,effective_radius_m )
     print(quality_for_range(effective_radius_m,sensor))
     print(quality_for_range(sensor.max_range_m/2,sensor))
-    x_2, y_2 = grid.pixel_to_world(int(center_row/2), int(center_col+200))
-    x_3, y_3 = grid.pixel_to_world(int(center_row/2), int(center_col+270))
-    x_4, y_4 = grid.pixel_to_world(int(center_row/2+50), int(center_col-250))
-    x_5, y_5 = grid.pixel_to_world(int(center_row/2+80), int(center_col-300))
-
 
     traversable = traversable_mask(grid, ROBOT_RADIUS_M)
     # print(traversable)
@@ -321,13 +313,12 @@ def plan_viewpoints(grid: OccupancyGrid, sensor: SensorModel) -> list[tuple[floa
     # poses = _candidate_poses(grid, traversable, effective_radius_m/10)
 
     if not poses or num_walls == 0:
-        return poses[:1]
-    #     # Degenerate map: fall back to the free-space centroid so we still
-    #     # return something valid rather than an empty plan.
-    #     free = grid.free_cells()
-    #     r, c = free.mean(axis=0)
-    #     return [grid.pixel_to_world(int(r), int(c))]
-    # """
+        # Degenerate map: fall back to the free-space centroid so we still
+        # return something valid rather than an empty plan.
+        free = grid.free_cells()
+        r, c = free.mean(axis=0)
+        return [grid.pixel_to_world(int(r), int(c))]
+    
     coverage = _coverage_sets(grid, poses, sensor, wall_index)
     print("len stops at grid & traversable", len(poses))
     print("No of coverage sets", len(coverage))
